@@ -21,11 +21,18 @@ MAG16 = b"\x62\x0f"       # magic(2) + ts(2, BE)
 
 def decode_config(cfg: int) -> Tuple[int, int, int, bool]:
     """Return (nch, bytes_per_sample, header_len, res_is_24bit)."""
-    chans_code = (cfg >> 11) & 0x03
+    # chans_code = (cfg >> 11) & 0x03
+    # nch = [2, 4, 8, 16][chans_code]
+    # res24 = ((cfg >> 7) & 1) == 1
+    # bps = 3 if res24 else 2
+    # hdr = 6 if res24 else 4
+    # return nch, bps, hdr, res24
+    chans_code = (cfg >> 9) & 0x03              # 10..9
     nch = [2, 4, 8, 16][chans_code]
-    res24 = ((cfg >> 7) & 1) == 1
+
+    res24 = ((cfg >> 6) & 1) == 1               # bit 6
     bps = 3 if res24 else 2
-    hdr = 6 if res24 else 4
+    hdr = 6 if res24 else 4                     # magic+timestamp sizes unchanged
     return nch, bps, hdr, res24
 
 def expected_frame_len(nch: int, bps: int, hdr: int, blocks: int) -> int:
@@ -127,19 +134,18 @@ class UIParams:
     
 
 def build_cfg_bits(p: UIParams, transmission_on: bool, set_config: bool = True) -> int:
-    """Pack the 16-bit command exactly like your firmware expects."""
     cmd = 0
-    cmd |= (0 << 15)                                 # Action: SET
-    cmd |= (p.fs_code & 0b11) << 13
-    cmd |= (p.nch_code & 0b11) << 11
-    cmd |= (p.mode_code & 0b111) << 8                # using 3 bits as in firmware
-    cmd |= (1 if p.res_24 else 0) << 7
-    cmd |= (1 if p.hpf_on else 0) << 6
-    cmd |= (p.gain_code & 0b11) << 4                 # firmware currently masks 2 bits
-    cmd |= 0 << 2                                    # VREF fixed 
-    cmd |= (1 if set_config else 0) << 1
-    cmd |= (1 if transmission_on else 0)
-    return cmd & 0xFFFF
+    cmd |= (0 & 0x01) << 13                    # Action: SET
+    cmd |= (p.fs_code  & 0x03) << 11           # FS (12..11)
+    cmd |= (p.nch_code & 0x03) << 9            # NCH (10..9)
+    cmd |= (p.mode_code & 0x03) << 7           # MODE (8..7)
+    cmd |= (1 if p.res_24 else 0) << 6         # RES (6)
+    cmd |= (1 if p.hpf_on else 0) << 5         # HPF (5)
+    cmd |= (p.gain_code & 0x07) << 2           # GAIN (4..2)  <-- now 3 bits
+    cmd |= (1 if set_config else 0) << 1       # CFG (1)
+    cmd |= (1 if transmission_on else 0)       # TX (0)
+    return cmd & 0x3FFF                        # highest used bit is 13
+
 
 # ---------------- Controller that runs Bleak via qasync ----------------
 class BLEController(QtCore.QObject):
@@ -291,7 +297,8 @@ class MainWindow(QMainWindow):
         g.addWidget(self.cb_mode, 1, 1)
         # Gain (limited to 2 bits per current firmware mask)
         g.addWidget(QLabel("Gain"), 2, 0)
-        self.cb_gain = QComboBox(); self.cb_gain.addItems(["6 (Default)","1","2","3"])  # 0..3
+        self.cb_gain = QComboBox(); 
+        self.cb_gain.addItems(["6 (Default)", "1", "2", "3", "4", "8", "12"])  # 0..3
         g.addWidget(self.cb_gain, 2, 1)
 
         # Vref
