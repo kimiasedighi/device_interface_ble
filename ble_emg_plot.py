@@ -1,7 +1,12 @@
+# online plotting of EMG data from BLE device (it has bugs yet to be fixed)
 import sys, asyncio, csv, datetime as dt
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
-from PySide6 import QtWidgets, QtCore
+
+import numpy as np
+import pyqtgraph as pg
+
+from PySide6 import QtCore
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGroupBox, QLabel, QComboBox,
     QPushButton, QRadioButton, QGridLayout, QVBoxLayout, QHBoxLayout
@@ -11,18 +16,22 @@ from bleak import BleakScanner, BleakClient
 
 # ---------------- BLE UUIDs (must match firmware) ----------------
 SVC_UUID = "12345678-1234-1234-1234-1234567890ab"
-TX_UUID  = "12345678-1234-1234-1234-1234567890ac"   # Notify
-RX_UUID  = "12345678-1234-1234-1234-1234567890ad"   # Write
+TX_UUID  = "12345678-1234-1234-1234-1234567890ac"   # notify
+RX_UUID  = "12345678-1234-1234-1234-1234567890ad"   # write
 DEVICE_NAME_DEFAULT = "Bracelet-EMG"
 
 # ---------------- Framing (matches your microcontroller) ----------------
-MAG24 = b"\x00\x62\x0f"
-MAG16 = b"\x62\x0f"
+MAG24 = b"\x00\x62\x0f"   # magic(3) + ts(3, BE)
+MAG16 = b"\x62\x0f"       # magic(2) + ts(2, BE)
 
 def decode_config(cfg: int) -> Tuple[int, int, int, bool]:
-    chans_code = (cfg >> 9) & 0x03
+    """
+    New layout: |13 SET|12..11 FS|10..9 NCH|8..7 MODE|6 RES|5 HPF|4..2 GAIN|1 CFG|0 TX|
+    Return (nch, bytes_per_sample, header_len, res_is_24bit).
+    """
+    chans_code = (cfg >> 9) & 0x03              # 10..9
     nch = [2, 4, 8, 16][chans_code]
-    res24 = ((cfg >> 6) & 1) == 1
+    res24 = ((cfg >> 6) & 1) == 1               # bit 6
     bps = 3 if res24 else 2
     hdr = 6 if res24 else 4
     return nch, bps, hdr, res24
@@ -30,6 +39,7 @@ def decode_config(cfg: int) -> Tuple[int, int, int, bool]:
 def expected_frame_len(nch: int, bps: int, hdr: int, blocks: int) -> int:
     return hdr + blocks * nch * bps
 
+# ------------------------- Frame parser -------------------------
 class FrameParser:
     def __init__(self, nch: int, bps: int, hdr: int, res24: bool, blocks: int):
         self.nch, self.bps, self.hdr, self.res24, self.blocks = nch, bps, hdr, res24, blocks
@@ -47,14 +57,17 @@ class FrameParser:
         n = len(self.buf)
         if j < 0 or j + self.hdr > n:
             return None
+
         if self.res24:
             ts = (self.buf[j+3] << 16) | (self.buf[j+4] << 8) | self.buf[j+5]
             payload_start = j + 6
         else:
             ts = (self.buf[j+2] << 8) | self.buf[j+3]
             payload_start = j + 4
+
         if j + self.frame_len > n:
             return None
+
         payload = self.buf[payload_start : payload_start + (self.blocks * self.nch * self.bps)]
         samples: List[List[int]] = []
         k = 0
@@ -63,9 +76,9 @@ class FrameParser:
             for _ch in range(self.nch):
                 raw = payload[k : k + self.bps]
                 if self.bps == 3:
-                    val = int.from_bytes(raw, "big", signed=True)
+                    val = int.from_bytes(raw, "big", signed=True)  # 24-bit signed
                 else:
-                    v = int.from_bytes(raw, "big", signed=False)
+                    v = int.from_bytes(raw, "big", signed=False)   # packed unsigned → signed
                     if v & 0x8000:
                         v -= 1 << 16
                     val = v
@@ -91,7 +104,7 @@ class FrameParser:
             del self.buf[:i]
         return out
 
-# ---------------- CSV writer ----------------
+# ---------------- CSV writer (optional) ----------------
 class CSVWriter:
     def __init__(self, path: str, nch: int, flush_every: int = 100):
         self.f = open(path, "w", newline="", buffering=1)
@@ -112,34 +125,38 @@ class CSVWriter:
             try: self.f.close()
             except: pass
 
-# ---------------- UI Parameter container ----------------
+# ---------------- UI Parameters ----------------
 @dataclass
 class UIParams:
-    fs_code: int
-    nch_code: int
-    mode_code: int
-    res_24: bool
-    hpf_on: bool
-    gain_code: int
+    fs_code: int          # 0:500, 1:1000, 2:2000, 3:4000
+    nch_code: int         # 0:2, 1:4, 2:8, 3:16
+    mode_code: int        # 0:MONO, 1:BIPOLAR, 2:IMP, 3:TEST
+    res_24: bool          # True = 24-bit
+    hpf_on: bool          # True = filter ON
+    gain_code: int        # 0..6 (3-bit gain)
 
 def build_cfg_bits(p: UIParams, transmission_on: bool, set_config: bool = True) -> int:
-    cmd = 0
-    cmd |= (0 & 0x01) << 13
-    cmd |= (p.fs_code  & 0x03) << 11
-    cmd |= (p.nch_code & 0x03) << 9
-    cmd |= (p.mode_code & 0x03) << 7
-    cmd |= (1 if p.res_24 else 0) << 6
-    cmd |= (1 if p.hpf_on else 0) << 5
-    cmd |= (p.gain_code & 0x07) << 2
-    cmd |= (1 if set_config else 0) << 1
-    cmd |= (1 if transmission_on else 0)
+    """
+    New layout: |13 SET|12..11 FS|10..9 NCH|8..7 MODE|6 RES|5 HPF|4..2 GAIN|1 CFG|0 TX|
+    """
+    cmd  = 0
+    cmd |= (0 & 0x01) << 13                    # Action: SET
+    cmd |= (p.fs_code  & 0x03) << 11           # FS (12..11)
+    cmd |= (p.nch_code & 0x03) << 9            # NCH (10..9)
+    cmd |= (p.mode_code & 0x03) << 7           # MODE (8..7)
+    cmd |= (1 if p.res_24 else 0) << 6         # RES (6)
+    cmd |= (1 if p.hpf_on else 0) << 5         # HPF (5)
+    cmd |= (p.gain_code & 0x07) << 2           # GAIN (4..2)
+    cmd |= (1 if set_config else 0) << 1       # CFG (1)
+    cmd |= (1 if transmission_on else 0)       # TX (0)
     return cmd & 0x3FFF
 
-# ---------------- BLE Controller ----------------
+# ---------------- Controller (Bleak via qasync) ----------------
 class BLEController(QtCore.QObject):
     status = QtCore.Signal(str)
     streaming_changed = QtCore.Signal(bool)
     frames_progress = QtCore.Signal(int)
+    data_frame = QtCore.Signal(object)   # ndarray (nch, k)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -153,61 +170,40 @@ class BLEController(QtCore.QObject):
         self._address = None
 
     async def start(self, device_name: str, cfg: int, blocks: int, csv_path: Optional[str]):
+        # Decode for parser + CSV
         self.nch, bps, hdr, res24 = decode_config(cfg)
         self.blocks = blocks
         self.parser = FrameParser(self.nch, bps, hdr, res24, blocks)
         self._frame_cnt = 0
         self._device_name = device_name or DEVICE_NAME_DEFAULT
 
+        # Optional CSV
         if csv_path:
             self.writer = CSVWriter(csv_path, self.nch)
             self.status.emit(f"CSV → {csv_path}")
         else:
             self.writer = None
 
-        # Try cached address first
-        if self._address:
-            self.status.emit(f"Trying cached address {self._address}…")
-            try:
-                self.client = BleakClient(self._address, timeout=20.0)
-                await self.client.__aenter__()
-                if self.client.is_connected:
-                    self.status.emit("Connected (cached address).")
-                else:
-                    await self.client.__aexit__(None, None, None)
-                    self.client = None
-            except Exception:
-                self.client = None
+        # Resolve device
+        self.status.emit(f"Scanning for {self._device_name}…")
+        devs = await BleakScanner.discover(timeout=5.0)
+        d = next((x for x in devs if (x.name or "") == self._device_name), None)
+        if not d:
+            self.status.emit("Device not found.")
+            return
+        self._address = d.address
+        self.status.emit(f"Found {self._address}, connecting…")
 
-        # If not connected, perform filtered scan
-        if not self.client:
-            self.status.emit(f"Scanning for {self._device_name} or service {SVC_UUID}…")
+        # Connect
+        self.client = BleakClient(self._address, timeout=20.0)
+        await self.client.__aenter__()
+        if not self.client.is_connected:
+            self.status.emit("Connect failed")
+            await self._cleanup()
+            return
+        self.status.emit("Connected")
 
-            def _matches(d, ad):
-                name = (d.name or "").lower()
-                try:
-                    uuids = [u.lower() for u in (ad.service_uuids or [])]
-                except AttributeError:
-                    uuids = []
-                return (self._device_name.lower() in name) or (SVC_UUID.lower() in uuids)
-
-            d = await BleakScanner.find_device_by_filter(_matches, timeout=15.0)
-            if not d:
-                await asyncio.sleep(1)
-                d = await BleakScanner.find_device_by_filter(_matches, timeout=10.0)
-            if not d:
-                self.status.emit("Device not found (check bracelet advertising).")
-                return
-            self._address = d.address
-            self.status.emit(f"Found {self._address}, connecting…")
-            self.client = BleakClient(self._address, timeout=20.0)
-            await self.client.__aenter__()
-            if not self.client.is_connected:
-                self.status.emit("Connection failed.")
-                await self._cleanup()
-                return
-
-        self.status.emit("Connected.")
+        # Subscribe, then send config (LE)
         await self.client.start_notify(TX_UUID, self._on_notify)
         cfg_le = bytes([cfg & 0xFF, (cfg >> 8) & 0xFF])
         await self.client.write_gatt_char(RX_UUID, cfg_le, response=True)
@@ -235,50 +231,53 @@ class BLEController(QtCore.QObject):
     async def _cleanup(self):
         if self.client:
             try:
-                await self.client.stop_notify(TX_UUID)
-            except Exception:
-                pass
-            try:
-                await self.client.disconnect()
-            except Exception:
-                pass
-            try:
                 await self.client.__aexit__(None, None, None)
             except Exception:
                 pass
-            await asyncio.sleep(0.3)
         self.client = None
         if self.writer:
             self.writer.close()
             self.writer = None
         self.parser = None
 
+    # Notification callback
     def _on_notify(self, _handle, data: bytes):
         if not self.parser:
             return
+
         self.parser.feed(data)
+        collected = []
         for ts, blocks in self.parser.frames():
-            self._frame_cnt += 1
             if self.writer:
-                self.writer.write_samples(ts, blocks)
+                self.writer.write_samples(ts, blocks)   # keep CSV writing per frame
+            # blocks: List[List[int]] -> shape (blocks, nch)
+            arr = np.asarray(blocks, dtype=np.int32).T   # -> (nch, blocks)
+            collected.append(arr)
+            self._frame_cnt += 1
             if (self._frame_cnt % 25) == 0:
                 self.status.emit(
-                    f"[frame {self._frame_cnt:06d}] ts={ts} len={len(blocks)} x {self.nch}ch (notif {len(data)}B, frame {self.parser.frame_len}B)"
+                    f"[frame {self._frame_cnt:06d}] ts={ts} len={len(blocks)} x {self.nch}ch"
+                    f" (notif {len(data)}B, frame {self.parser.frame_len}B)"
                 )
             self.frames_progress.emit(self._frame_cnt)
 
-# ---------------- UI ----------------
+        if collected:
+            combo = np.concatenate(collected, axis=1)   # (nch, total_blocks)
+            self.data_frame.emit(combo)
+
+# ---------------- Main Window (UI) ----------------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("N-Switch Bracelet (BLE)")
-        self.resize(520, 430)
+        self.resize(800, 600)
+        pg.setConfigOptions(antialias=True)
 
         root = QWidget(self)
         self.setCentralWidget(root)
         v = QVBoxLayout(root)
 
-        # Connection group
+        # Connection
         self.grp_conn = QGroupBox("Connection parameters")
         g = QGridLayout(self.grp_conn)
         g.addWidget(QLabel("Device Name"), 0, 0)
@@ -288,7 +287,7 @@ class MainWindow(QMainWindow):
         g.addWidget(self.device_name, 0, 1)
         v.addWidget(self.grp_conn)
 
-        # Acquisition group
+        # Acquisition
         self.grp_acq = QGroupBox("Acquisition Parameters")
         g = QGridLayout(self.grp_acq)
         g.addWidget(QLabel("Sampling Frequency"), 0, 0)
@@ -299,21 +298,42 @@ class MainWindow(QMainWindow):
         g.addWidget(self.cb_nch, 1, 1)
         v.addWidget(self.grp_acq)
 
-        # Input group
+        # Input
         self.grp_in = QGroupBox("Input Parameters")
         g = QGridLayout(self.grp_in)
+        # Resolution
         self.rb_16 = QRadioButton("16 Bit"); self.rb_24 = QRadioButton("24 Bit"); self.rb_24.setChecked(True)
         g.addWidget(QLabel("Resolution"), 0, 0)
-        rr = QHBoxLayout(); rr.addWidget(self.rb_16); rr.addWidget(self.rb_24)
-        g.addLayout(rr, 0, 1)
+        rr = QHBoxLayout(); rr.addWidget(self.rb_16); rr.addWidget(self.rb_24); g.addLayout(rr, 0, 1)
+        # Mode
         g.addWidget(QLabel("Mode"), 1, 0)
         self.cb_mode = QComboBox(); self.cb_mode.addItems(["MONOPOLAR","BIPOLAR","IMPEDANCE","TEST"])
         g.addWidget(self.cb_mode, 1, 1)
+        # Gain (3-bit)
         g.addWidget(QLabel("Gain"), 2, 0)
         self.cb_gain = QComboBox()
-        self.cb_gain.addItems(["6 (Default)", "1", "2", "3", "4", "8", "12"])
+        self.cb_gain.addItems(["6 (Default)", "1", "2", "3", "4", "8", "12"])  # maps 0..6 to your enum
         g.addWidget(self.cb_gain, 2, 1)
         v.addWidget(self.grp_in)
+
+        # Live plot
+        self.plot = pg.PlotWidget()
+        self.plot.setBackground("w")
+        self.plot.setLabel('bottom', 'Time', units='s')
+        self.plot.showGrid(x=True, y=True, alpha=0.2)
+        v.addWidget(self.plot, 1)
+
+        # Live plot state
+        self.display_time = 5.0                     # seconds visible
+        self.fs_map = [500, 1000, 2000, 4000]
+        self.fs = self.fs_map[self.cb_fs.currentIndex()]
+        self.buff = None                            # ring buffer: ndarray (nch, L)
+        self.buf_pos = 0
+        self.curves = []
+        self._t = None
+        self._render_timer = QtCore.QTimer(self)
+        self._render_timer.setInterval(33)          # ~30 FPS
+        self._render_timer.timeout.connect(self._render_plot)
 
         # Buttons
         row = QHBoxLayout()
@@ -323,19 +343,23 @@ class MainWindow(QMainWindow):
         v.addLayout(row)
 
         # Status
-        self.lbl_status = QLabel("Idle"); v.addWidget(self.lbl_status)
+        self.lbl_status = QLabel("Idle")
+        v.addWidget(self.lbl_status)
 
         # Controller
         self.ctrl = BLEController()
         self.ctrl.status.connect(self.lbl_status.setText)
         self.ctrl.streaming_changed.connect(self._on_streaming_changed)
+        self.ctrl.data_frame.connect(self._on_data_frame)
 
         # Events
         self.btn_stream.clicked.connect(self._on_stream_clicked)
         self.btn_stop.clicked.connect(self._on_stop_clicked)
 
+        # Defaults
         self.blocks = 10
 
+    # ---- Helpers ----
     def _params_from_ui(self) -> UIParams:
         return UIParams(
             fs_code=self.cb_fs.currentIndex(),
@@ -346,27 +370,35 @@ class MainWindow(QMainWindow):
             gain_code=self.cb_gain.currentIndex(),
         )
 
-    def _csv_path(self) -> str:
+    def _csv_path(self) -> Optional[str]:
+        # Return None to disable CSV entirely
         ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         return f"emg_{ts}.csv"
 
     def _disable_controls(self, disable: bool):
-        self.grp_conn.setEnabled(not disable)
-        self.grp_acq.setEnabled(not disable)
-        self.grp_in.setEnabled(not disable)
-        self.btn_stream.setEnabled(not disable)
+        enabled = not disable
+        self.grp_conn.setEnabled(enabled)
+        self.grp_acq.setEnabled(enabled)
+        self.grp_in.setEnabled(enabled)
+        self.btn_stream.setEnabled(enabled)
         self.btn_stop.setEnabled(disable)
 
     def _on_streaming_changed(self, s: bool):
         self._disable_controls(s)
         self.lbl_status.setText("Streaming…" if s else "Stopped")
+        if s:
+            # Reset plot buffer on (re)start
+            self.buff = None
+            self._render_timer.start()
+        else:
+            self._render_timer.stop()
 
     @asyncSlot()
     async def _on_stream_clicked(self):
         p = self._params_from_ui()
         cfg_on = build_cfg_bits(p, transmission_on=True, set_config=True)
         dev_name = self.device_name.currentText().strip() or DEVICE_NAME_DEFAULT
-        csv_path = self._csv_path()
+        csv_path = self._csv_path()  # set to None to disable
         self.lbl_status.setText("Starting…")
         await self.ctrl.start(dev_name, cfg_on, self.blocks, csv_path)
 
@@ -375,7 +407,6 @@ class MainWindow(QMainWindow):
         p = self._params_from_ui()
         cfg_off = build_cfg_bits(p, transmission_on=False, set_config=True)
         await self.ctrl.stop(cfg_off)
-        await asyncio.sleep(1.0)  # allow OS to fully release BLE handle
 
     def closeEvent(self, e):
         try:
@@ -385,6 +416,61 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             pass
         super().closeEvent(e)
+
+    # ---- Plotting ----
+    def _init_plot_buffer(self, nch: int):
+        self.fs = self.fs_map[self.cb_fs.currentIndex()]
+        L = max(10, int(self.display_time * self.fs))
+        self.buff = np.zeros((nch, L), dtype=np.float32)
+        self.buf_pos = 0
+        self._t = np.linspace(-self.display_time, 0, L, endpoint=False)
+
+        self.plot.clear()
+        self.curves = [self.plot.plot([], []) for _ in range(nch)]
+        self.plot.setXRange(-self.display_time, 0)
+
+    @QtCore.Slot(object)
+    def _on_data_frame(self, arr: np.ndarray):
+        """
+        arr: shape (nch, k) with k new samples per channel.
+        Append into ring buffer and let the render timer draw it.
+        """
+        if self.buff is None:
+            self._init_plot_buffer(arr.shape[0])
+
+        nch, L = self.buff.shape
+        _, k = arr.shape
+        if k >= L:
+            arr = arr[:, -L:]
+            k = L
+
+        end = self.buf_pos + k
+        if end <= L:
+            self.buff[:, self.buf_pos:end] = arr
+        else:
+            rst = L - self.buf_pos
+            self.buff[:, self.buf_pos:] = arr[:, :rst]
+            self.buff[:, :end - L] = arr[:, rst:]
+        self.buf_pos = (self.buf_pos + k) % L
+
+    def _render_plot(self):
+        if self.buff is None or self._t is None:
+            return
+        nch, L = self.buff.shape
+        # get window in time order
+        win = np.roll(self.buff, -self.buf_pos, axis=1)
+
+        # robust per-channel scaling and stacking
+        stack_gap = 1.0
+        for ch in range(nch):
+            seg = win[ch]
+            amp = np.percentile(np.abs(seg), 95)
+            if not np.isfinite(amp) or amp <= 0:
+                amp = 1.0
+            y = (seg / (2.0 * amp)) + ch * stack_gap   # keep approx ±0.5 range per channel
+            self.curves[ch].setData(self._t, y)
+
+        self.plot.setYRange(-0.5, (nch - 1) * stack_gap + 0.5)
 
 def main():
     app = QApplication(sys.argv)
