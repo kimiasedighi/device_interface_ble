@@ -11,11 +11,10 @@ from bleak import BleakScanner, BleakClient
 
 # ---------------- BLE UUIDs (must match firmware) ----------------
 SVC_UUID = "12345678-1234-1234-1234-1234567890ab"
-TX_UUID  = "12345678-1234-1234-1234-1234567890ac"   # Notify
-RX_UUID  = "12345678-1234-1234-1234-1234567890ad"   # Write
-DEVICE_NAME_DEFAULT = "Bracelet-EMG"
+TX_UUID  = "12345678-1234-1234-1234-1234567890ac"
+RX_UUID  = "12345678-1234-1234-1234-1234567890ad"
 
-# ---------------- Framing (matches your microcontroller) ----------------
+# ---------------- Framing ----------------
 MAG24 = b"\x00\x62\x0f"
 MAG16 = b"\x62\x0f"
 
@@ -43,58 +42,83 @@ class FrameParser:
         magic = MAG24 if self.res24 else MAG16
         return self.buf.find(magic, start)
 
+    # def _parse_one(self, j: int):
+    #     n = len(self.buf)
+    #     if j < 0 or j + self.hdr > n:
+    #         return None
+    #     if self.res24:
+    #         ts = (self.buf[j+3] << 16) | (self.buf[j+4] << 8) | self.buf[j+5]
+    #         payload_start = j + 6
+    #     else:
+    #         ts = (self.buf[j+2] << 8) | self.buf[j+3]
+    #         payload_start = j + 4
+    #     if j + self.frame_len > n:
+    #         return None
+    #     payload = self.buf[payload_start : payload_start + (self.blocks * self.nch * self.bps)]
+    #     samples: List[List[int]] = []
+    #     k = 0
+    #     for _ in range(self.blocks):
+    #         row = []
+    #         for _ch in range(self.nch):
+    #             raw = payload[k : k + self.bps]
+    #             if self.bps == 3:
+    #                 val = int.from_bytes(raw, "big", signed=True)
+    #             else:
+    #                 v = int.from_bytes(raw, "big", signed=False)
+    #                 if v & 0x8000:
+    #                     v -= 1 << 16
+    #                 val = v
+    #             row.append(val)
+    #             k += self.bps
+    #         samples.append(row)
+    #     return ts, samples, j + self.frame_len
     def _parse_one(self, j: int):
         n = len(self.buf)
         if j < 0 or j + self.hdr > n:
             return None
+
+        # Timestamp
         if self.res24:
             ts = (self.buf[j+3] << 16) | (self.buf[j+4] << 8) | self.buf[j+5]
             payload_start = j + 6
         else:
             ts = (self.buf[j+2] << 8) | self.buf[j+3]
             payload_start = j + 4
+
+        # Timestamp rollover
+        if hasattr(self, "_last_ts"):
+            if ts < self._last_ts:      # wrapped
+                self._ts_base += (1 << (24 if self.res24 else 16))
+        else:
+            self._ts_base = 0
+        self._last_ts = ts
+        ts += self._ts_base
+
         if j + self.frame_len > n:
             return None
-        # payload = self.buf[payload_start : payload_start + (self.blocks * self.nch * self.bps)]
-        # samples: List[List[int]] = []
-        # k = 0
-        # for _ in range(self.blocks):
-        #     row = []
-        #     for _ch in range(self.nch):
-        #         raw = payload[k : k + self.bps]
-        #         if self.bps == 3:
-        #             val = int.from_bytes(raw, "big", signed=True)
-        #         else:
-        #             v = int.from_bytes(raw, "big", signed=False)
-        #             if v & 0x8000:
-        #                 v -= 1 << 16
-        #             val = v
-        #         row.append(val)
-        #         k += self.bps
-        #     samples.append(row)
-        # return ts, samples, j + self.frame_len
-        payload = self.buf[payload_start : payload_start + (self.blocks * self.nch * self.bps)]
-        samples: List[List[int]] = []
+
+        payload = self.buf[payload_start: payload_start + (self.blocks*self.nch*self.bps)]
+        samples = []
         k = 0
+
         for _ in range(self.blocks):
             row = []
-            for _ch in range(self.nch):
-                raw = payload[k : k + self.bps]
-                if self.bps == 3:
-                    # --- REVISED 24-BIT LOGIC ---
+            for _ in range(self.nch):
+                raw = payload[k:k+self.bps]
+
+                if self.bps == 3:     # 24-bit unsigned packed
                     v = int.from_bytes(raw, "big", signed=False)
-                    if v & 0x800000:  # Check the sign bit for 24-bit
+                    if v & 0x800000:
                         v -= 1 << 24
-                    val = v
-                    # --- END REVISION ---
-                else: # 16-bit logic is fine
+                else:                 # 16-bit unsigned packed
                     v = int.from_bytes(raw, "big", signed=False)
                     if v & 0x8000:
                         v -= 1 << 16
-                    val = v
-                row.append(val)
+
+                row.append(v)
                 k += self.bps
             samples.append(row)
+
         return ts, samples, j + self.frame_len
 
     def frames(self) -> List[Tuple[int, List[List[int]]]]:
@@ -135,7 +159,7 @@ class CSVWriter:
             try: self.f.close()
             except: pass
 
-# ---------------- UI Parameter container ----------------
+# ---------------- Config container ----------------
 @dataclass
 class UIParams:
     fs_code: int
@@ -147,7 +171,6 @@ class UIParams:
 
 def build_cfg_bits(p: UIParams, transmission_on: bool, set_config: bool = True) -> int:
     cmd = 0
-    cmd |= (0 & 0x01) << 13
     cmd |= (p.fs_code  & 0x03) << 11
     cmd |= (p.nch_code & 0x03) << 9
     cmd |= (p.mode_code & 0x03) << 7
@@ -172,15 +195,12 @@ class BLEController(QtCore.QObject):
         self.nch = 2
         self.blocks = 10
         self._frame_cnt = 0
-        self._device_name = DEVICE_NAME_DEFAULT
-        self._address = None
 
-    async def start(self, device_name: str, cfg: int, blocks: int, csv_path: Optional[str]):
+    async def start(self, address: Optional[str], cfg: int, blocks: int, csv_path: Optional[str]):
         self.nch, bps, hdr, res24 = decode_config(cfg)
         self.blocks = blocks
         self.parser = FrameParser(self.nch, bps, hdr, res24, blocks)
         self._frame_cnt = 0
-        self._device_name = device_name or DEVICE_NAME_DEFAULT
 
         if csv_path:
             self.writer = CSVWriter(csv_path, self.nch)
@@ -188,50 +208,33 @@ class BLEController(QtCore.QObject):
         else:
             self.writer = None
 
-        # Try cached address first
-        if self._address:
-            self.status.emit(f"Trying cached address {self._address}…")
-            try:
-                self.client = BleakClient(self._address, timeout=20.0)
-                await self.client.__aenter__()
-                if self.client.is_connected:
-                    self.status.emit("Connected (cached address).")
-                else:
-                    await self.client.__aexit__(None, None, None)
-                    self.client = None
-            except Exception:
-                self.client = None
-
-        # If not connected, perform filtered scan
-        if not self.client:
-            self.status.emit(f"Scanning for {self._device_name} or service {SVC_UUID}…")
-
-            def _matches(d, ad):
-                name = (d.name or "").lower()
-                try:
-                    uuids = [u.lower() for u in (ad.service_uuids or [])]
-                except AttributeError:
-                    uuids = []
-                return (self._device_name.lower() in name) or (SVC_UUID.lower() in uuids)
-
-            d = await BleakScanner.find_device_by_filter(_matches, timeout=15.0)
-            if not d:
-                await asyncio.sleep(1)
-                d = await BleakScanner.find_device_by_filter(_matches, timeout=10.0)
-            if not d:
-                self.status.emit("Device not found (check bracelet advertising).")
+        # If address is empty, scan for our bracelet
+        if not address or address.startswith("No devices"):
+            self.status.emit("Scanning for Bracelet-EMG…")
+            dev = await BleakScanner.find_device_by_filter(
+                lambda d, ad: (d.name and "bracelet" in d.name.lower()) or
+                              (SVC_UUID.lower() in [u.lower() for u in (ad.service_uuids or [])]),
+                timeout=10.0
+            )
+            if not dev:
+                self.status.emit("Device not found.")
                 return
-            self._address = d.address
-            self.status.emit(f"Found {self._address}, connecting…")
-            self.client = BleakClient(self._address, timeout=20.0)
+            address = dev.address
+
+        self.status.emit(f"Connecting to {address}…")
+        try:
+            self.client = BleakClient(address, timeout=20.0)
             await self.client.__aenter__()
             if not self.client.is_connected:
-                self.status.emit("Connection failed.")
-                await self._cleanup()
-                return
+                raise Exception("Connect failed.")
+        except Exception as e:
+            self.status.emit(f"Connection failed: {e}")
+            await self._cleanup()
+            return
 
         self.status.emit("Connected.")
         await self.client.start_notify(TX_UUID, self._on_notify)
+
         cfg_le = bytes([cfg & 0xFF, (cfg >> 8) & 0xFF])
         await self.client.write_gatt_char(RX_UUID, cfg_le, response=True)
         self.status.emit(f"Configured 0x{cfg:04X}; streaming…")
@@ -258,10 +261,6 @@ class BLEController(QtCore.QObject):
     async def _cleanup(self):
         if self.client:
             try:
-                await self.client.stop_notify(TX_UUID)
-            except Exception:
-                pass
-            try:
                 await self.client.disconnect()
             except Exception:
                 pass
@@ -286,7 +285,7 @@ class BLEController(QtCore.QObject):
                 self.writer.write_samples(ts, blocks)
             if (self._frame_cnt % 25) == 0:
                 self.status.emit(
-                    f"[frame {self._frame_cnt:06d}] ts={ts} len={len(blocks)} x {self.nch}ch (notif {len(data)}B, frame {self.parser.frame_len}B)"
+                    f"[frame {self._frame_cnt:06d}] ts={ts} len={len(blocks)} x {self.nch}ch"
                 )
             self.frames_progress.emit(self._frame_cnt)
 
@@ -304,25 +303,23 @@ class MainWindow(QMainWindow):
         # Connection group
         self.grp_conn = QGroupBox("Connection parameters")
         g = QGridLayout(self.grp_conn)
-        g.addWidget(QLabel("Device Name"), 0, 0)
+        g.addWidget(QLabel("Device"), 0, 0)
         self.device_name = QComboBox()
-        self.device_name.setEditable(True)
-        self.device_name.addItems([DEVICE_NAME_DEFAULT])
         g.addWidget(self.device_name, 0, 1)
         v.addWidget(self.grp_conn)
 
-        # Acquisition group
+        # Acquisition
         self.grp_acq = QGroupBox("Acquisition Parameters")
         g = QGridLayout(self.grp_acq)
         g.addWidget(QLabel("Sampling Frequency"), 0, 0)
         self.cb_fs = QComboBox(); self.cb_fs.addItems(["500", "1000", "2000", "4000"]); self.cb_fs.setCurrentIndex(0)
         g.addWidget(self.cb_fs, 0, 1)
-        g.addWidget(QLabel("Number of Channels"), 1, 0)
+        g.addWidget(QLabel("Channels"), 1, 0)
         self.cb_nch = QComboBox(); self.cb_nch.addItems(["2", "4", "8", "16"]); self.cb_nch.setCurrentIndex(0)
         g.addWidget(self.cb_nch, 1, 1)
         v.addWidget(self.grp_acq)
 
-        # Input group
+        # Input
         self.grp_in = QGroupBox("Input Parameters")
         g = QGridLayout(self.grp_in)
         self.rb_16 = QRadioButton("16 Bit"); self.rb_24 = QRadioButton("24 Bit"); self.rb_24.setChecked(True)
@@ -333,8 +330,7 @@ class MainWindow(QMainWindow):
         self.cb_mode = QComboBox(); self.cb_mode.addItems(["MONOPOLAR","BIPOLAR","IMPEDANCE","TEST"])
         g.addWidget(self.cb_mode, 1, 1)
         g.addWidget(QLabel("Gain"), 2, 0)
-        self.cb_gain = QComboBox()
-        self.cb_gain.addItems(["6 (Default)", "1", "2", "3", "4", "8", "12"])
+        self.cb_gain = QComboBox(); self.cb_gain.addItems(["6 (Default)", "1", "2", "3", "4", "8", "12"])
         g.addWidget(self.cb_gain, 2, 1)
         v.addWidget(self.grp_in)
 
@@ -358,6 +354,22 @@ class MainWindow(QMainWindow):
         self.btn_stop.clicked.connect(self._on_stop_clicked)
 
         self.blocks = 10
+        QtCore.QTimer.singleShot(100, lambda: asyncio.create_task(self._refresh_devices()))
+
+    async def _refresh_devices(self):
+        self.device_name.clear()
+        self.device_name.addItem("Scanning…")
+        await asyncio.sleep(0)
+        devs = await BleakScanner.discover(timeout=5.0)
+        self.device_name.clear()
+        if not devs:
+            self.device_name.addItem("No devices found")
+            return
+        for d in devs:
+            if not d.name:
+                continue
+            label = f"{d.name} ({d.address})"
+            self.device_name.addItem(label, userData=d.address)
 
     def _params_from_ui(self) -> UIParams:
         return UIParams(
@@ -388,17 +400,16 @@ class MainWindow(QMainWindow):
     async def _on_stream_clicked(self):
         p = self._params_from_ui()
         cfg_on = build_cfg_bits(p, transmission_on=True, set_config=True)
-        dev_name = self.device_name.currentText().strip() or DEVICE_NAME_DEFAULT
-        csv_path = self._csv_path()
+        idx = self.device_name.currentIndex()
+        address = self.device_name.itemData(idx)
         self.lbl_status.setText("Starting…")
-        await self.ctrl.start(dev_name, cfg_on, self.blocks, csv_path)
+        await self.ctrl.start(address, cfg_on, self.blocks, self._csv_path())
 
     @asyncSlot()
     async def _on_stop_clicked(self):
         p = self._params_from_ui()
         cfg_off = build_cfg_bits(p, transmission_on=False, set_config=True)
         await self.ctrl.stop(cfg_off)
-        await asyncio.sleep(1.0)  # allow OS to fully release BLE handle
 
     def closeEvent(self, e):
         try:
