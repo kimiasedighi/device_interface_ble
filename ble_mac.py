@@ -55,6 +55,24 @@ class FrameParser:
             payload_start = j + 4
         if j + self.frame_len > n:
             return None
+        # payload = self.buf[payload_start : payload_start + (self.blocks * self.nch * self.bps)]
+        # samples: List[List[int]] = []
+        # k = 0
+        # for _ in range(self.blocks):
+        #     row = []
+        #     for _ch in range(self.nch):
+        #         raw = payload[k : k + self.bps]
+        #         if self.bps == 3:
+        #             val = int.from_bytes(raw, "big", signed=True)
+        #         else:
+        #             v = int.from_bytes(raw, "big", signed=False)
+        #             if v & 0x8000:
+        #                 v -= 1 << 16
+        #             val = v
+        #         row.append(val)
+        #         k += self.bps
+        #     samples.append(row)
+        # return ts, samples, j + self.frame_len
         payload = self.buf[payload_start : payload_start + (self.blocks * self.nch * self.bps)]
         samples: List[List[int]] = []
         k = 0
@@ -63,8 +81,13 @@ class FrameParser:
             for _ch in range(self.nch):
                 raw = payload[k : k + self.bps]
                 if self.bps == 3:
-                    val = int.from_bytes(raw, "big", signed=True)
-                else:
+                    # --- REVISED 24-BIT LOGIC ---
+                    v = int.from_bytes(raw, "big", signed=False)
+                    if v & 0x800000:  # Check the sign bit for 24-bit
+                        v -= 1 << 24
+                    val = v
+                    # --- END REVISION ---
+                else: # 16-bit logic is fine
                     v = int.from_bytes(raw, "big", signed=False)
                     if v & 0x8000:
                         v -= 1 << 16
