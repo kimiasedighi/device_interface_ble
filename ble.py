@@ -171,11 +171,13 @@ class UIParams:
 
 def build_cfg_bits(p: UIParams, transmission_on: bool, set_config: bool = True) -> int:
     cmd = 0
+    cmd |= (1 << 13)                              # ActionMode=SET
     cmd |= (p.fs_code  & 0x03) << 11
     cmd |= (p.nch_code & 0x03) << 9
     cmd |= (p.mode_code & 0x03) << 7
     cmd |= (1 if p.res_24 else 0) << 6
     cmd |= (1 if p.hpf_on else 0) << 5
+    # cmd |= (0) << 5
     cmd |= (p.gain_code & 0x07) << 2
     cmd |= (1 if set_config else 0) << 1
     cmd |= (1 if transmission_on else 0)
@@ -330,7 +332,7 @@ class MainWindow(QMainWindow):
         self.cb_mode = QComboBox(); self.cb_mode.addItems(["MONOPOLAR","BIPOLAR","IMPEDANCE","TEST"])
         g.addWidget(self.cb_mode, 1, 1)
         g.addWidget(QLabel("Gain"), 2, 0)
-        self.cb_gain = QComboBox(); self.cb_gain.addItems(["6 (Default)", "1", "2", "3", "4", "8", "12"])
+        self.cb_gain = QComboBox(); self.cb_gain.addItems(["1", "2", "4", "6", "8", "12", "24"])
         g.addWidget(self.cb_gain, 2, 1)
         v.addWidget(self.grp_in)
 

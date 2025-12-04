@@ -27,28 +27,12 @@ def plot_emg(csv_path: str):
 
     print(f"[INFO] Found {len(channel_cols)} channels: {channel_cols}")
 
-    # ---------------- Timestamp processing ----------------
-    if "timestamp" in df.columns:
-        ts = df["timestamp"].values
-        time = (ts - ts[0]) / 1000.0  # convert ms → seconds
-
-        # Estimate sampling rate safely
-        diffs = np.diff(ts)
-        dt_ms = np.median(diffs) if len(diffs) > 0 else 0
-
-        if dt_ms <= 0:
-            print("[WARN] Timestamp resolution too coarse → fallback fs = 1000 Hz")
-            fs = 1000
-        else:
-            fs = round(1.0 / (dt_ms / 1000.0))
-
-        print(f"[INFO] Sampling rate estimated: {fs} Hz")
-
-    else:
-        # fallback if no timestamp
-        fs = 1000
-        time = np.arange(len(df)) / fs
-        print("[WARN] No timestamp column found — assuming 1000 Hz")
+    # ---------------- Timestamp processing ----------------s
+    # fallback if no timestamp
+    fs = 2000
+    print("Len is =:", len(df))
+    time = np.arange(len(df)) / fs
+    print("[WARN] No timestamp column found — assuming 1000 Hz")
 
     # ---------------- Create subplots ----------------
     fig, axes = plt.subplots(len(channel_cols), 1, sharex=True,
@@ -76,6 +60,25 @@ def plot_emg(csv_path: str):
 
     axes[-1].set_xlabel("Time (s)")
     fig.suptitle(f"EMG Data – {csv_path}")
+    plt.tight_layout()
+
+    # Plot power spectrum of every channel in a separate figure
+    fig_psd, axes_psd = plt.subplots(len(channel_cols), 1, sharex=True,
+                                     figsize=(12, 2.3 * len(channel_cols)))
+    if len(channel_cols) == 1:
+        axes_psd = [axes_psd]
+    for i, ch in enumerate(channel_cols):
+        sig = df[ch].values.astype(float)
+        sig = sig - np.mean(sig)
+
+        # Compute power spectrum and plot in logarithmic scale in db/Hz
+        freqs = np.fft.rfftfreq(len(sig), d=1/fs)
+        psd = np.abs(np.fft.rfft(sig))**2 / len(sig)
+        axes_psd[i].semilogx(freqs, 10 * np.log10(psd), lw=0.8)
+        axes_psd[i].set_ylabel(f"{ch} PSD (dB/Hz)")
+        axes_psd[i].grid(True, alpha=0.3)
+    axes_psd[-1].set_xlabel("Frequency (Hz)")
+    fig_psd.suptitle(f"EMG Power Spectrum – {csv_path}")
     plt.tight_layout()
     plt.show()
 
