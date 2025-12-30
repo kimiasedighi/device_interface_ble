@@ -415,7 +415,18 @@ class BLEController(QtCore.QObject):
         for ts, blocks in self.parser.frames():
             self._frame_cnt += 1
             if self.writer:
-                self.writer.write_samples(ts, blocks)
+                # test for data
+                
+                VREF = 4.5
+                BITS = (24 if self.res24 else 16)
+                lsb = (2 * VREF) / (self.cb_gain * (2**BITS - 1))
+
+                # convert blocks (list of rows) to microvolts
+                blocks_uv = [[v * lsb * 1e6 for v in row] for row in blocks]
+                self.writer.write_samples(ts, blocks_uv)
+                # end of test
+                
+                # self.writer.write_samples(ts, blocks)
             if (self._frame_cnt % 25) == 0:
                 self.status.emit(
                     f"[frame {self._frame_cnt:06d}] ts={ts} len={len(blocks)} x {self.nch}ch"
