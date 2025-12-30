@@ -1,3 +1,26 @@
+"""
+Device Interface for Bracelet-EMG (BLE)
+
+This module implements the PC-side interface for controlling and acquiring
+biosignal data from the Bracelet-EMG firmware over Bluetooth Low Energy (BLE).
+
+Responsibilities:
+- Discover and connect to the Bracelet-EMG device via BLE
+- Encode and transmit configuration commands
+- Receive, frame, and decode streamed EMG data
+- Persist decoded samples to CSV
+- Provide a Qt-based GUI for user interaction
+
+Technologies:
+- BLE: bleak
+- GUI: PySide6 + qasync
+- Async I/O: asyncio
+- Data framing aligned with firmware protocol
+
+This module is the authoritative reference implementation of the
+Bracelet-EMG communication protocol on the PC side.
+"""
+
 import sys, asyncio, csv, datetime as dt
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
@@ -9,16 +32,25 @@ from PySide6.QtWidgets import (
 from qasync import QEventLoop, asyncSlot
 from bleak import BleakScanner, BleakClient
 
-# ---------------- BLE UUIDs (must match firmware) ----------------
+# BLE UUIDs (must match firmware)
 SVC_UUID = "12345678-1234-1234-1234-1234567890ab"
 TX_UUID  = "12345678-1234-1234-1234-1234567890ac"
 RX_UUID  = "12345678-1234-1234-1234-1234567890ad"
 
-# ---------------- Framing ----------------
+# Framing magic numbers (packet alignment)
 MAG24 = b"\x00\x62\x0f"
 MAG16 = b"\x62\x0f"
 
 def decode_config(cfg: int) -> Tuple[int, int, int, bool]:
+    """
+    Decode a 16-bit configuration command.
+
+    Extracts channel count, bytes-per-sample, header length,
+    and resolution mode from the packed configuration word.
+
+    :param cfg: 16-bit configuration command
+    :return: (num_channels, bytes_per_sample, header_size, is_24bit)
+    """
     chans_code = (cfg >> 9) & 0x03
     nch = [2, 4, 8, 16][chans_code]
     res24 = ((cfg >> 6) & 1) == 1
@@ -27,15 +59,55 @@ def decode_config(cfg: int) -> Tuple[int, int, int, bool]:
     return nch, bps, hdr, res24
 
 def expected_frame_len(nch: int, bps: int, hdr: int, blocks: int) -> int:
+    """
+    Compute the expected frame length in bytes.
+
+    :param nch: Number of channels
+    :param bps: Bytes per sample
+    :param hdr: Header size in bytes
+    :param blocks: Number of blocks per frame
+    :return: Total frame length in bytes
+    """
     return hdr + blocks * nch * bps
 
 class FrameParser:
+
+    """
+    Incremental decoder for Bracelet-EMG data frames.
+
+    This class reconstructs full frames from fragmented BLE notifications.
+    It handles:
+    - Frame alignment using magic numbers
+    - Timestamp extraction and rollover handling
+    - Signed sample decoding (16-bit / 24-bit)
+    - Block-wise sample grouping
+
+    Frames are returned as:
+        (timestamp, samples)
+
+    where samples is a list of blocks, each block being a list of channel values.
+    """
     def __init__(self, nch: int, bps: int, hdr: int, res24: bool, blocks: int):
+        """
+        Initialize a frame parser.
+
+        :param nch: Number of channels
+        :param bps: Bytes per sample
+        :param hdr: Header size in bytes
+        :param res24: True for 24-bit resolution
+        :param blocks: Number of blocks per frame
+        """
         self.nch, self.bps, self.hdr, self.res24, self.blocks = nch, bps, hdr, res24, blocks
         self.buf = bytearray()
         self.frame_len = expected_frame_len(nch, bps, hdr, blocks)
 
     def feed(self, data: bytes):
+        """
+        Feed raw BLE notification data into the parser.
+
+        Data may contain partial frames, multiple frames,
+        or frame fragments.
+        """
         self.buf.extend(data)
 
     def _find_header(self, start: int) -> int:
@@ -122,6 +194,11 @@ class FrameParser:
         return ts, samples, j + self.frame_len
 
     def frames(self) -> List[Tuple[int, List[List[int]]]]:
+        """
+        Extract all complete frames currently available in the buffer.
+
+        :return: List of decoded frames (timestamp, samples)
+        """
         out = []
         i = 0
         while True:
@@ -140,6 +217,12 @@ class FrameParser:
 
 # ---------------- CSV writer ----------------
 class CSVWriter:
+    """
+    Streaming CSV writer for EMG samples.
+
+    Writes decoded EMG samples incrementally to disk,
+    flushing periodically to reduce data loss risk.
+    """
     def __init__(self, path: str, nch: int, flush_every: int = 100):
         self.f = open(path, "w", newline="", buffering=1)
         self.w = csv.writer(self.f)
@@ -147,11 +230,18 @@ class CSVWriter:
         self.rows = 0
         self.flush_every = flush_every
     def write_samples(self, ts: int, block_rows: List[List[int]]):
+        """
+        Write a block of samples to CSV.
+
+        :param ts: Timestamp associated with the block
+        :param block_rows: List of per-channel sample rows
+        """
         for row in block_rows:
             self.w.writerow([ts] + row)
             self.rows += 1
             if self.rows % self.flush_every == 0:
                 self.f.flush()
+    
     def close(self):
         try:
             self.f.flush()
@@ -170,6 +260,17 @@ class UIParams:
     gain_code: int
 
 def build_cfg_bits(p: UIParams, transmission_on: bool, set_config: bool = True) -> int:
+    """
+    Build a 16-bit configuration command.
+
+    Encodes UI parameters into the firmware-defined
+    configuration word format.
+
+    :param p: UI parameters
+    :param transmission_on: Enable or disable streaming
+    :param set_config: Apply configuration immediately
+    :return: Packed configuration word
+    """
     cmd = 0
     cmd |= (1 << 13)                              # ActionMode=SET
     cmd |= (p.fs_code  & 0x03) << 11
@@ -185,6 +286,17 @@ def build_cfg_bits(p: UIParams, transmission_on: bool, set_config: bool = True) 
 
 # ---------------- BLE Controller ----------------
 class BLEController(QtCore.QObject):
+    """
+    Asynchronous BLE controller for Bracelet-EMG.
+
+    Manages:
+    - Device discovery and connection
+    - Configuration transmission
+    - Streaming lifecycle
+    - Frame decoding and CSV logging
+
+    Emits Qt signals for UI updates.
+    """
     status = QtCore.Signal(str)
     streaming_changed = QtCore.Signal(bool)
     frames_progress = QtCore.Signal(int)
@@ -199,6 +311,14 @@ class BLEController(QtCore.QObject):
         self._frame_cnt = 0
 
     async def start(self, address: Optional[str], cfg: int, blocks: int, csv_path: Optional[str]):
+        """
+        Connect to the device, apply configuration, and start streaming.
+
+        :param address: BLE MAC address or None to auto-scan
+        :param cfg: Configuration word
+        :param blocks: Number of blocks per frame
+        :param csv_path: Optional CSV output path
+        """
         self.nch, bps, hdr, res24 = decode_config(cfg)
         self.blocks = blocks
         self.parser = FrameParser(self.nch, bps, hdr, res24, blocks)
@@ -243,6 +363,11 @@ class BLEController(QtCore.QObject):
         self.streaming_changed.emit(True)
 
     async def stop(self, cfg_off: Optional[int] = None):
+        """
+        Stop streaming and disconnect from the device.
+
+        Optionally sends a configuration command to disable transmission.
+        """
         if self.client and cfg_off is not None:
             try:
                 cfg_le = bytes([cfg_off & 0xFF, (cfg_off >> 8) & 0xFF])
@@ -278,6 +403,12 @@ class BLEController(QtCore.QObject):
         self.parser = None
 
     def _on_notify(self, _handle, data: bytes):
+        """
+        BLE notification handler.
+
+        Receives raw BLE data, feeds it into the frame parser,
+        and forwards decoded samples to the CSV writer.
+        """
         if not self.parser:
             return
         self.parser.feed(data)
@@ -293,6 +424,15 @@ class BLEController(QtCore.QObject):
 
 # ---------------- UI ----------------
 class MainWindow(QMainWindow):
+    """
+    Main GUI window for Bracelet-EMG device control.
+
+    Provides controls for:
+    - BLE device selection
+    - Acquisition parameters
+    - Streaming start/stop
+    - Real-time status updates
+    """
     def __init__(self):
         super().__init__()
         self.setWindowTitle("N-Switch Bracelet (BLE)")
@@ -329,10 +469,10 @@ class MainWindow(QMainWindow):
         rr = QHBoxLayout(); rr.addWidget(self.rb_16); rr.addWidget(self.rb_24)
         g.addLayout(rr, 0, 1)
         g.addWidget(QLabel("Mode"), 1, 0)
-        self.cb_mode = QComboBox(); self.cb_mode.addItems(["MONOPOLAR","BIPOLAR","IMPEDANCE","TEST"])
+        self.cb_mode = QComboBox(); self.cb_mode.addItems(["MONOPOLAR","BIPOLAR","IMPEDANCE","TEST"]); self.cb_mode.setCurrentIndex(0)
         g.addWidget(self.cb_mode, 1, 1)
         g.addWidget(QLabel("Gain"), 2, 0)
-        self.cb_gain = QComboBox(); self.cb_gain.addItems(["1", "2", "4", "6", "8", "12", "24"])
+        self.cb_gain = QComboBox(); self.cb_gain.addItems(["1", "2", "4", "6", "8", "12", "24"]); self.cb_gain.setCurrentIndex(0)
         g.addWidget(self.cb_gain, 2, 1)
         v.addWidget(self.grp_in)
 
@@ -423,6 +563,12 @@ class MainWindow(QMainWindow):
         super().closeEvent(e)
 
 def main():
+    """
+    Application entry point.
+
+    Initializes Qt, asyncio event loop integration,
+    and launches the main GUI window.
+    """
     app = QApplication(sys.argv)
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)
