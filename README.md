@@ -1,1 +1,1 @@
-This is the device interface code that recieves EMG data by bluetooth from a bracelet. at first commit, it works fine with the old config pattern. 
+I have to change this README file, but the README in bracelet part explains everything (just for now).
