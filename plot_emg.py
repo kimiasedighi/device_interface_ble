@@ -54,7 +54,7 @@ def plot_emg(csv_path: str):
     fs = 2000
     print("Len is =:", len(df))
     time = np.arange(len(df)) / fs
-    print("[WARN] No timestamp column found — assuming 1000 Hz")
+    print("[WARN] No timestamp column found — assuming 2000 Hz")
 
     # ---------------- Create subplots ----------------
     fig, axes = plt.subplots(len(channel_cols), 1, sharex=True,
@@ -68,7 +68,9 @@ def plot_emg(csv_path: str):
         sig = df[ch].values.astype(float)
 
         # Remove DC offset (recommended for EMG)
-        # sig = sig - np.mean(sig)
+        sig = df[ch].values.astype(float)
+        sig = sig - np.mean(sig)
+        
         signal.append(sig)
 
         # Optional band-pass filter
